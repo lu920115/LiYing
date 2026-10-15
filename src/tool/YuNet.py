@@ -131,6 +131,19 @@ class FaceDetector:
                            backend_id=backend_id,
                            target_id=target_id)
 
+    def detect_array(self, image, max_size=640):
+        """Detect faces in an in-memory BGR image; rows: [x, y, w, h, 10 landmark values, score] in original pixels."""
+        h, w = image.shape[:2]
+        f = min(1.0, max_size / max(h, w))
+        small = cv.resize(image, None, fx=f, fy=f) if f != 1 else image
+        self.model.set_input_size([small.shape[1], small.shape[0]])
+        res = self.model.infer(small)
+        if res is None:
+            return np.zeros((0, 15))
+        res = res[:, :15].copy()
+        res[:, :14] /= f
+        return res
+
     def process_image(self, image_path, origin_size=False):
         """
         Process the image for face detection.

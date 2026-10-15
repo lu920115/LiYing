@@ -38,6 +38,7 @@ class ImageSegmentation:
             raise RuntimeError(f"Failed to load ONNX model: {e}")
 
         self.rgb_list = rgb_to_rgba(rgb_list)
+        self.imagenet_norm = 'birefnet' in model_path.lower()
 
     def preprocess_image(self, im: np.ndarray) -> np.ndarray:
         # If the image is grayscale, add a dimension to make it a color image
@@ -51,8 +52,12 @@ class ImageSegmentation:
         # Normalize image pixel values to the [0, 1] range
         image = im_resized.astype(np.float32) / 255.0
         # Further normalize image data
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        if self.imagenet_norm:
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        else:
+            mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+            std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         image = (image - mean) / std
         # Convert the image to the required shape
         image = image.transpose(2, 0, 1)  # Change dimension order (channels, height, width)
@@ -61,6 +66,8 @@ class ImageSegmentation:
     def postprocess_image(self, result: np.ndarray, im_size: list) -> np.ndarray:
         # Resize the result image to match the original image size
         result = np.squeeze(result)
+        if self.imagenet_norm and (result.min() < 0 or result.max() > 1):
+            result = 1.0 / (1.0 + np.exp(-result.astype(np.float32)))
         try:
             result = np.array(Image.fromarray(result).resize(im_size, Image.BILINEAR))
         except Exception as e:

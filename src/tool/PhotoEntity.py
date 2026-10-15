@@ -6,6 +6,7 @@ import numpy as np
 
 from .yolov8_detector import YOLOv8Detector
 from .YuNet import FaceDetector
+from .SCRFD import SCRFD
 from .agpic import ImageCompressor
 
 
@@ -128,11 +129,25 @@ class PhotoEntity:
         else:
             self._reset_person_data()
 
+    def _get_scrfd(self):
+        if not hasattr(self, '_scrfd'):
+            path = os.path.join(os.environ.get('LIYING_MODEL_DIR', '/Users/wenquanlu/31localmodel/liying'), 'det_10g.onnx')
+            self._scrfd = SCRFD(path) if os.path.exists(path) else None
+        return self._scrfd
+
     def detect_face(self):
         """
         Detect faces in the image.
         """
-        face_results = self.face_detector.process_image(self.img_path)
+        face_results = None
+        scrfd = self._get_scrfd()
+        if scrfd is not None:
+            found = scrfd.detect_array(self.image)
+            if len(found) > 0:
+                best = max(found, key=lambda f: f[14] * f[2] * f[3])
+                face_results = best[None, :4]
+        if face_results is None:
+            face_results = self.face_detector.process_image(self.img_path)
         if not (face_results is None) and len(face_results) > 0:
             self.face_bbox = face_results[0][:4].astype('uint32')
             self.face_width = int(self.face_bbox[2]) - int(self.face_bbox[0])

@@ -8,6 +8,7 @@ import numpy as np
 import piexif
 from PIL import Image
 
+from .SCRFD import SCRFD
 from .ImageSegmentation import ImageSegmentation, rgb_to_rgba
 from .PhotoEntity import PhotoEntity
 from .PhotoRequirements import PhotoRequirements
@@ -108,7 +109,71 @@ class ImageProcessor:
         angle = np.arctan2(dy, dx) * (180 / np.pi)  # Compute the angle
         return angle
 
-    def crop_and_correct_image(self) -> PhotoEntity:
+    def _get_scrfd(self):
+        if not hasattr(self, '_scrfd'):
+            path = os.path.join(os.environ.get('LIYING_MODEL_DIR', '/Users/wenquanlu/31localmodel/liying'), 'det_10g.onnx')
+            self._scrfd = SCRFD(path) if os.path.exists(path) else None
+        return self._scrfd
+
+    def _best_face(self, img):
+        scrfd = self._get_scrfd()
+        faces = scrfd.detect_array(img) if scrfd else []
+        if len(faces) == 0:
+            faces = self.photo.face_detector.detect_array(img)
+        if len(faces) == 0:
+            return None
+        return max(faces, key=lambda f: f[14] * f[2] * f[3])
+
+    def orient_by_face(self):
+        """Fix 90/180/270 orientation and eye-line tilt using face landmarks. Returns the face row or None."""
+        img = self.photo.image
+        turns = [None, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE]
+        best = None
+        for code in turns:
+            cand = img if code is None else cv.rotate(img, code)
+            face = self._best_face(cand)
+            if face is not None and (best is None or face[14] > best[1][14] + 0.05):
+                best = (cand, face)
+            if best is not None and code is None and best[1][14] > 0.9:
+                break
+        if best is None:
+            return None
+        img, face = best
+        re_, le_ = face[4:6], face[6:8]
+        angle = float(np.degrees(np.arctan2(le_[1] - re_[1], le_[0] - re_[0])))
+        if abs(angle) > 2:
+            h, w = img.shape[:2]
+            m = cv.getRotationMatrix2D(((re_[0] + le_[0]) / 2, (re_[1] + le_[1]) / 2), angle, 1.0)
+            img = cv.warpAffine(img, m, (w, h), flags=cv.INTER_CUBIC, borderMode=cv.BORDER_REPLICATE)
+            face = self._best_face(img)
+            if face is None:
+                return None
+        self.photo.image = img
+        return face
+
+    def compose_by_face(self, aspect=None) -> bool:
+        """Orient, align and crop around the detected face with ID-photo proportions, padding edges if needed."""
+        face = self.orient_by_face()
+        if face is None:
+            return False
+        aspect = aspect or 0.75
+        img = self.photo.image
+        h, w = img.shape[:2]
+        fx, fy, fw, fh = [float(v) for v in face[:4]]
+        cx, cy = fx + fw / 2, fy + fh / 2
+        crop_h = fh * 2.7
+        crop_w = crop_h * aspect
+        x1, y1 = int(cx - crop_w / 2), int(cy - crop_h * 0.42)
+        x2, y2 = int(x1 + crop_w), int(y1 + crop_h)
+        pad = [max(0, -y1), max(0, y2 - h), max(0, -x1), max(0, x2 - w)]
+        if any(pad):
+            img = cv.copyMakeBorder(img, *pad, cv.BORDER_REPLICATE)
+        y1, y2, x1, x2 = y1 + pad[0], y2 + pad[0], x1 + pad[2], x2 + pad[2]
+        self.photo.image = img[y1:y2, x1:x2]
+        self.photo.person_bbox = [0, 0, self.photo.image.shape[1], self.photo.image.shape[0]]
+        return True
+
+    def crop_and_correct_image(self, smart_compose=False, aspect=None) -> PhotoEntity:
         """
         Crop and correct the human region in the image
 
@@ -116,6 +181,9 @@ class ImageProcessor:
         :rtype: PhotoEntity
         :raises ValueError: If no single person is detected
         """
+        if smart_compose or self.photo.person_bbox is None:
+            if self.compose_by_face(aspect):
+                return self.photo
         if self.photo.person_bbox is not None:
             height, width = self.photo.image.shape[:2]
 

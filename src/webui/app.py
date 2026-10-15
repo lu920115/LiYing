@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import locale
 import os
@@ -30,7 +31,9 @@ SAVE_IMG_DIR = os.path.join(PROJECT_ROOT, 'output')
 
 DEFAULT_YOLOV8_PATH = os.path.join(MODEL_DIR, 'yolov8n-pose.onnx')
 DEFAULT_YUNET_PATH = os.path.join(MODEL_DIR, 'face_detection_yunet_2023mar.onnx')
-DEFAULT_RMBG_PATH = os.path.join(MODEL_DIR, 'RMBG-1.4-model.onnx')
+LOCAL_MODEL_DIR = os.environ.get('LIYING_MODEL_DIR', '/Users/wenquanlu/31localmodel/liying')
+_BIREFNET = os.path.join(LOCAL_MODEL_DIR, 'BiRefNet-portrait-epoch_150.onnx')
+DEFAULT_RMBG_PATH = _BIREFNET if os.path.exists(_BIREFNET) else os.path.join(MODEL_DIR, 'RMBG-1.4-model.onnx')
 DEFAULT_SIZE_CONFIG = os.path.join(DATA_DIR, 'size_{}.csv')
 DEFAULT_COLOR_CONFIG = os.path.join(DATA_DIR, 'color_{}.csv')
 
@@ -43,6 +46,7 @@ from tool.ImageProcessor import ImageProcessor
 from tool.PhotoSheetGenerator import PhotoSheetGenerator
 from tool.PhotoRequirements import PhotoRequirements
 from tool.ConfigManager import ConfigManager
+from tool.ImageEnhancer import apply_post_bgr, crop_margins
 
 def get_language():
     """Get the system language or default to English."""
@@ -172,8 +176,14 @@ def composite_bgra_on_rgb(image, rgb_list):
     out = fg * alpha[..., None] + bg_bgr * (1.0 - alpha[..., None])
     return out.astype(np.uint8)
 
-def process_image(img_path, yolov8_path, yunet_path, rmbg_path, photo_requirements, photo_type, photo_sheet_size, rgb_list, compress=False, change_background=False, rotate=False, resize=True, sheet_rows=3, sheet_cols=3, add_crop_lines=True, layout_position=4, photos_spacing=0):
+def process_image(img_path, yolov8_path, yunet_path, rmbg_path, photo_requirements, photo_type, photo_sheet_size, rgb_list, compress=False, change_background=False, rotate=False, resize=True, sheet_rows=3, sheet_cols=3, add_crop_lines=True, layout_position=4, photos_spacing=10, post_opts=None):
     """Process the image with specified parameters."""
+    crop = (post_opts or {}).get('crop')
+    tmp_crop = None
+    if crop and any(crop):
+        tmp_crop = os.path.join(tempfile.mkdtemp(), 'cropped.png')
+        crop_margins(Image.open(img_path).convert('RGB'), *crop).save(tmp_crop)
+        img_path = tmp_crop
     processor = ImageProcessor(img_path, 
                             yolov8_model_path=yolov8_path,
                             yunet_model_path=yunet_path,
@@ -181,7 +191,15 @@ def process_image(img_path, yolov8_path, yunet_path, rmbg_path, photo_requiremen
                             rgb_list=rgb_list, 
                             y_b=compress)
 
-    processor.crop_and_correct_image()
+    try:
+        aspect = None
+        if resize:
+            info = photo_requirements.get_resize_image_list(photo_type)
+            aspect = info['width'] / info['height']
+        processor.crop_and_correct_image(smart_compose=bool((post_opts or {}).get('smart')), aspect=aspect)
+    finally:
+        if tmp_crop:
+            shutil.rmtree(os.path.dirname(tmp_crop), ignore_errors=True)
     
     # Get file size limits from CSV if enabled
     file_size_limits = {}
@@ -198,7 +216,7 @@ def process_image(img_path, yolov8_path, yunet_path, rmbg_path, photo_requiremen
         processor.resize_image(photo_type)
 
     corrected_image_alpha = processor.photo.image
-    corrected_image_bgr = composite_bgra_on_rgb(corrected_image_alpha, rgb_list)
+    corrected_image_bgr = apply_post_bgr(composite_bgra_on_rgb(corrected_image_alpha, rgb_list), post_opts)
 
     sheet_info = photo_requirements.get_resize_image_list(photo_sheet_size)
     sheet_width, sheet_height, sheet_resolution = sheet_info['width'], sheet_info['height'], sheet_info['resolution']
@@ -269,6 +287,12 @@ def create_demo(initial_language, deployment_mode):
         batch_processed_paths = gr.State([])
         batch_download_offset = gr.State(0)
         batch_temp_dir = gr.State(None, delete_callback=cleanup_temp_dir)
+        photo_store = gr.State({})
+        prev_photo = gr.State(None)
+        current_photo = gr.State(None)
+        gallery_paths = gr.State([])
+        sel_files = gr.State(None)
+        sel_prev_dir = gr.State(None)
 
         title = gr.Markdown(f"# {t('title', initial_language)}")
 
@@ -279,18 +303,37 @@ def create_demo(initial_language, deployment_mode):
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_image = gr.File(
-                    file_count="multiple",
-                    file_types=["image"],
-                    type="filepath",
-                    label=t('upload_photo', initial_language),
-                    height=160
+                gr.HTML("""<style>
+                #liying-photos .grid-container {
+                    grid-template-columns: repeat(auto-fill, 88px) !important;
+                    grid-template-rows: none !important;
+                    grid-auto-rows: 88px !important;
+                    gap: 6px !important;
+                    justify-content: start;
+                }
+                #liying-photos .thumbnail-item { width: 88px !important; height: 88px !important; }
+                #liying-photos .thumbnail-item.selected {
+                    border: 2px solid var(--color-accent) !important;
+                    box-shadow: 0 0 0 3px var(--color-accent-soft, rgba(99, 102, 241, .35)) !important;
+                    background: var(--color-accent-soft, rgba(99, 102, 241, .25)) !important;
+                }
+                </style>""")
+                gallery_kwargs = dict(
+                    value=None, interactive=True, type="filepath", file_types=["image"],
+                    columns=6, rows=1, height=190, object_fit="cover", elem_id="liying-photos",
+                    allow_preview=False, show_download_button=False, show_share_button=False,
+                    label=t('upload_photo', initial_language)
                 )
-                lang_dropdown = gr.Dropdown(
-                    choices=[("English", "en"), ("中文", "zh")], 
-                    value=initial_language, 
-                    label=t('language', initial_language)
+                supported = inspect.signature(gr.Gallery.__init__).parameters
+                photo_gallery = gr.Gallery(**{k: v for k, v in gallery_kwargs.items() if k in supported})
+                add_photos_btn = gr.UploadButton(
+                    t('add_photos', initial_language), file_count="multiple", file_types=["image"], size="sm"
                 )
+                with gr.Group(visible=False) as switch_prompt:
+                    gr.Markdown(t('switch_prompt', initial_language))
+                    with gr.Row():
+                        use_prev_btn = gr.Button(t('use_prev_params', initial_language))
+                        use_default_btn = gr.Button(t('use_default_params', initial_language))
 
                 with gr.Tabs():
                     with gr.TabItem(t('key_param', initial_language)) as key_param_tab:
@@ -324,9 +367,51 @@ def create_demo(initial_language, deployment_mode):
                         layout_only = gr.Checkbox(label=t('layout_only', initial_language), value=False)
                         sheet_rows = gr.Slider(minimum=1, maximum=10, step=1, value=3, label=t('sheet_rows', initial_language))
                         sheet_cols = gr.Slider(minimum=1, maximum=10, step=1, value=3, label=t('sheet_cols', initial_language))
-                        photos_spacing = gr.Slider(minimum=0, maximum=100, step=1, value=0, label=t('photos_spacing', initial_language))
+                        photos_spacing = gr.Slider(minimum=0, maximum=100, step=1, value=10, label=t('photos_spacing', initial_language))
                     
+                    with gr.TabItem(t('more_params', initial_language)) as more_params_tab:
+                        L = initial_language
+                        gr.Markdown(t('crop_hint', L))
+                        with gr.Row():
+                            crop_top = gr.Slider(0, 45, value=0, step=1, label=t('crop_top', L))
+                            crop_bottom = gr.Slider(0, 45, value=0, step=1, label=t('crop_bottom', L))
+                        with gr.Row():
+                            crop_left = gr.Slider(0, 45, value=0, step=1, label=t('crop_left', L))
+                            crop_right = gr.Slider(0, 45, value=0, step=1, label=t('crop_right', L))
+                        with gr.Row():
+                            enh_brightness = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label=t('brightness', L))
+                            enh_contrast = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label=t('contrast', L))
+                        with gr.Row():
+                            enh_saturation = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label=t('saturation', L))
+                            enh_sharpness = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label=t('sharpness', L))
+                        with gr.Row():
+                            enh_smooth = gr.Slider(0, 100, value=0, step=5, label=t('smooth', L))
+                            enh_whiten = gr.Slider(0, 100, value=0, step=5, label=t('whiten', L))
+                        with gr.Row():
+                            enh_auto = gr.Checkbox(label=t('auto_enhance', L), value=False)
+                            enh_gray = gr.Checkbox(label=t('grayscale', L), value=False)
+                            smart_compose = gr.Checkbox(label=t('smart_compose', L), value=False, info=t('smart_compose_info', L))
+                        with gr.Row():
+                            tr_angle = gr.Slider(-180, 180, value=0, step=1, label=t('rotate_angle', L))
+                            tr_border = gr.Slider(0, 100, value=0, step=1, label=t('border', L))
+                        with gr.Row():
+                            tr_flip_h = gr.Checkbox(label=t('flip_h', L), value=False)
+                            tr_flip_v = gr.Checkbox(label=t('flip_v', L), value=False)
+                            tr_color = gr.ColorPicker(label=t('border_color', L), value="#FFFFFF")
+                        wm_text = gr.Textbox(label=t('wm_text', L), value="")
+                        with gr.Row():
+                            wm_opacity = gr.Slider(0.05, 1.0, value=0.35, step=0.05, label=t('wm_opacity', L))
+                            wm_size = gr.Slider(0, 200, value=0, step=1, label=t('wm_size', L))
+                        with gr.Row():
+                            wm_angle = gr.Slider(-90, 90, value=30, step=1, label=t('wm_angle', L))
+                            wm_tiled = gr.Checkbox(label=t('wm_tiled', L), value=True)
+
                     with gr.TabItem(t('advanced_settings', initial_language)) as advanced_settings_tab:
+                        lang_dropdown = gr.Dropdown(
+                            choices=[("English", "en"), ("中文", "zh")], 
+                            value=initial_language, 
+                            label=t('language', initial_language)
+                        )
                         yolov8_path = gr.Textbox(label=t('yolov8_path', initial_language), value=DEFAULT_YOLOV8_PATH)
                         yunet_path = gr.Textbox(label=t('yunet_path', initial_language), value=DEFAULT_YUNET_PATH)
                         rmbg_path = gr.Textbox(label=t('rmbg_path', initial_language), value=DEFAULT_RMBG_PATH)
@@ -429,11 +514,27 @@ def create_demo(initial_language, deployment_mode):
                                 value=SAVE_IMG_DIR,
                                 visible=(deployment_mode == 'local')
                             )
+                download_all_btn = gr.Button(t('download_all', initial_language))
+                download_all_file = gr.File(label=t('download_all_file', initial_language), height=100)
                 notification = gr.Textbox(label=t('notification', initial_language))
+
+        post_inputs = [crop_top, crop_bottom, crop_left, crop_right, enh_brightness, enh_contrast,
+                       enh_saturation, enh_sharpness, enh_smooth, enh_whiten, enh_auto, enh_gray,
+                       wm_text, wm_opacity, wm_size, wm_angle, wm_tiled,
+                       tr_angle, tr_border, tr_flip_h, tr_flip_v, tr_color, smart_compose]
+
+        def make_post_opts(extra):
+            keys = ['ct', 'cb', 'cl', 'cr', 'brightness', 'contrast', 'saturation', 'sharpness',
+                    'smooth', 'whiten', 'auto', 'gray', 'wm_text', 'wm_opacity', 'wm_size', 'wm_angle', 'wm_tiled',
+                    'rotate', 'border', 'flip_h', 'flip_v', 'border_color', 'smart']
+            o = dict(zip(keys, extra))
+            o['border_color'] = parse_color(o.get('border_color'))
+            o['crop'] = (o.get('ct'), o.get('cb'), o.get('cl'), o.get('cr'))
+            return o
 
         def process_and_display(input_files, yolov8_path, yunet_path, rmbg_path, size_config, color_config, photo_type,
                                         photo_sheet_size, background_color, compress, change_background, rotate, resize,
-                                        sheet_rows, sheet_cols, layout_only, add_crop_lines, layout_position, photos_spacing):
+                                        sheet_rows, sheet_cols, layout_only, add_crop_lines, layout_position, photos_spacing, post_opts=None):
             """Process and display image(s) with given parameters (supports batch)."""
             # Update the configuration file path of ConfigManager
             config_manager.size_file = size_config
@@ -488,7 +589,8 @@ def create_demo(initial_language, deployment_mode):
                         sheet_cols=sheet_cols,
                         add_crop_lines=add_crop_lines,
                         layout_position=layout_position,
-                        photos_spacing=photos_spacing
+                        photos_spacing=photos_spacing,
+                        post_opts=post_opts
                     )
                 except Exception as e:
                     errors.append(f"{Path(img_path).name}: {str(e)}")
@@ -513,7 +615,7 @@ def create_demo(initial_language, deployment_mode):
                                                 photo_type, photo_sheet_size, background_color, compress, change_background,
                                                 rotate, resize, sheet_rows, sheet_cols, layout_only, add_crop_lines,
                                                 target_size, size_range_min, size_range_max, use_csv_size, layout_position, photos_spacing,
-                                                lang, previous_temp_dir):
+                                                lang, previous_temp_dir, *extra):
             """Wrapper for process_and_display that also prepares download files (supports batch)."""
             nonlocal current_file_format, current_resolution
 
@@ -523,7 +625,8 @@ def create_demo(initial_language, deployment_mode):
             result = process_and_display(
                 input_files, yolov8_path, yunet_path, rmbg_path, size_config, color_config,
                 photo_type, photo_sheet_size, background_color, compress, change_background,
-                rotate, resize, sheet_rows, sheet_cols, layout_only, add_crop_lines, layout_position, photos_spacing
+                rotate, resize, sheet_rows, sheet_cols, layout_only, add_crop_lines, layout_position, photos_spacing,
+                post_opts=make_post_opts(extra)
             )
 
             if not result:
@@ -633,7 +736,7 @@ def create_demo(initial_language, deployment_mode):
                                       target_size, size_range_min, size_range_max, change_background, layout_only,
                                       rotate, sheet_rows, sheet_cols, add_crop_lines, layout_position, photos_spacing,
                                       lang, corrected_images_alpha, processed_paths, final_images, corrected_images,
-                                      offset, previous_temp_dir):
+                                      offset, previous_temp_dir, *extra):
             """
             Update preview/download outputs when only the background color changes.
             This avoids re-running the background removal model by reusing cached alpha images.
@@ -669,7 +772,7 @@ def create_demo(initial_language, deployment_mode):
             corrected_images_rgb = []
 
             for idx, img in enumerate(corrected_images_alpha):
-                corrected_bgr = composite_bgra_on_rgb(img, rgb_list)
+                corrected_bgr = apply_post_bgr(composite_bgra_on_rgb(img, rgb_list), make_post_opts(extra))
                 corrected_images_rgb.append(cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB))
 
                 sheet_bgr = generator.generate_photo_sheet(
@@ -778,7 +881,7 @@ def create_demo(initial_language, deployment_mode):
                 shutil.rmtree(output_dir, ignore_errors=True)
                 raise
 
-        def save_image_handler(image, path, lang, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, is_corrected, is_download_mode=False):
+        def save_image_handler(image, path, lang, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, is_corrected, is_download_mode=False, photo=None):
             nonlocal current_file_format, current_resolution, deployment_mode
             if image is None:
                 return t('no_image_to_save', lang) if not is_download_mode else None
@@ -786,10 +889,24 @@ def create_demo(initial_language, deployment_mode):
             if deployment_mode == 'server' and not is_download_mode:
                 return t('server_save_disabled', lang)
 
+            def auto_name():
+                parts = [re.sub(r'[<>:"/\\|?*]', '_', str(x)) for x in (
+                    Path(photo).stem if photo else None,
+                    'corrected' if is_corrected else 'sheet',
+                    photo_sheet_size, photo_type, background_color) if x]
+                return "_".join(parts)
+
+            def unique(directory, base):
+                candidate, n = f"{base}.{current_file_format}", 1
+                while os.path.exists(os.path.join(directory, candidate)):
+                    n += 1
+                    candidate = f"{base}_{n}.{current_file_format}"
+                return candidate
+
             # Download mode uses temporary files
             if is_download_mode:
                 temp_dir = tempfile.mkdtemp()
-                filename = f"{photo_sheet_size}_{photo_type}_{str(background_color)}_{int(time.time())}.{current_file_format}"
+                filename = unique(temp_dir, auto_name())
                 full_path = os.path.join(temp_dir, filename)
             else:
                 if not path.strip():
@@ -805,7 +922,7 @@ def create_demo(initial_language, deployment_mode):
 
                 if is_dir:
                     os.makedirs(path, exist_ok=True)
-                    filename = f"{photo_sheet_size}_{photo_type}_{str(background_color)}_{int(time.time())}.{current_file_format}"
+                    filename = unique(path, auto_name())
                     full_path = os.path.join(path, filename)
                 else:
                     dir_name = os.path.dirname(path)
@@ -900,7 +1017,7 @@ def create_demo(initial_language, deployment_mode):
 
             # The dictionary of updates to be returned
             updates = {title: gr.update(value=f"# {t('title', lang)}"),
-                       input_image: gr.update(label=t('upload_photo', lang)),
+                       photo_gallery: gr.update(label=t('upload_photo', lang)),
                        lang_dropdown: gr.update(label=t('language', lang)),
                        photo_type: gr.update(choices=new_photo_size_choices, label=t('photo_type', lang),
                                              value=new_photo_size_choices[0] if new_photo_size_choices else None),
@@ -964,7 +1081,9 @@ def create_demo(initial_language, deployment_mode):
                             label=t('size_input_option', lang),
                             choices=[(t('target_size_radio', lang), "target"), (t('size_range_radio', lang), "range")]
                         ), layout_position: gr.update(choices=new_layout_position_choices, value=4,
-                                                      label=t('layout_position', lang)), language: lang}
+                                                      label=t('layout_position', lang)), language: lang,
+                       download_all_btn: gr.update(value=t('download_all', lang)),
+                       download_all_file: gr.update(label=t('download_all_file', lang))}
             
             return updates
 
@@ -1114,7 +1233,7 @@ def create_demo(initial_language, deployment_mode):
                     })
             return updates
         
-        lang_outputs = [title, input_image, lang_dropdown, photo_type, photo_sheet_size, preset_color, background_color,
+        lang_outputs = [title, photo_gallery, lang_dropdown, photo_type, photo_sheet_size, preset_color, background_color,
                 sheet_rows, sheet_cols, photos_spacing, layout_only, yolov8_path, yunet_path, rmbg_path, size_config, color_config,
                 compress, change_background, rotate, resize, add_crop_lines, use_csv_size, target_size, size_range_min, size_range_max,
                 process_btn, output_image, corrected_output, download_final_file, download_corrected_file,
@@ -1123,7 +1242,7 @@ def create_demo(initial_language, deployment_mode):
                 size_config_tab, color_config_tab, result_tab, corrected_image_tab,
                 size_df, color_df, add_size_btn, update_size_btn,
                 add_color_btn, update_color_btn, config_notification,
-                size_option_type, language, layout_position]
+                size_option_type, language, layout_position, download_all_btn, download_all_file]
 
         lang_dropdown.change(
             update_language,
@@ -1150,7 +1269,7 @@ def create_demo(initial_language, deployment_mode):
         )
 
         # Background color preview: re-composite cached transparent result (no model re-run)
-        background_color.change(
+        bg_preview_evt = background_color.change(
             update_background_preview,
             inputs=[
                 background_color, photo_type, photo_sheet_size, compress, use_csv_size,
@@ -1158,7 +1277,7 @@ def create_demo(initial_language, deployment_mode):
                 rotate, sheet_rows, sheet_cols, add_crop_lines, layout_position, photos_spacing,
                 lang_dropdown, batch_corrected_images_alpha, batch_processed_paths,
                 batch_final_images, batch_corrected_images, batch_download_offset, batch_temp_dir
-            ],
+            ] + post_inputs,
             outputs=[
                 output_image, corrected_output, download_final_file, download_corrected_file,
                 batch_final_images, batch_corrected_images, batch_corrected_images_alpha, batch_processed_paths,
@@ -1184,16 +1303,151 @@ def create_demo(initial_language, deployment_mode):
             outputs=[size_option_type, target_size, size_range_min, size_range_max]
         )
 
+        param_comps = [photo_type, photo_sheet_size, layout_position, preset_color, background_color,
+                       layout_only, sheet_rows, sheet_cols, photos_spacing, compress, change_background,
+                       rotate, resize, add_crop_lines] + post_inputs
+        param_defaults = [c.value for c in param_comps]
+        result_comps = [output_image, corrected_output, download_final_file, download_corrected_file,
+                        batch_final_images, batch_corrected_images, batch_corrected_images_alpha,
+                        batch_processed_paths, batch_download_offset, batch_temp_dir]
+        empty_results = (None, None, None, None, [], [], [], [], 0, None)
+
+        thumb_dir = tempfile.mkdtemp(prefix="liying_thumbs_")
+        thumb_cache = {}
+
+        def make_thumb(path):
+            key = (path, os.path.getmtime(path))
+            if key not in thumb_cache:
+                out = os.path.join(thumb_dir, f"{len(thumb_cache)}.jpg")
+                try:
+                    with Image.open(path) as im:
+                        im = im.convert("RGB")
+                        im.thumbnail((240, 240))
+                        im.save(out, "JPEG", quality=80)
+                    thumb_cache[key] = out
+                except Exception:
+                    thumb_cache[key] = path
+            return thumb_cache[key]
+
+        def gallery_to_paths(items):
+            paths = []
+            for it in (items or []):
+                if isinstance(it, (tuple, list)):
+                    it = it[0]
+                if isinstance(it, dict):
+                    it = it.get('image', it).get('path') if isinstance(it.get('image', it), dict) else it.get('path')
+                elif not isinstance(it, str):
+                    it = getattr(getattr(it, 'image', it), 'path', None)
+                if it and Path(it).suffix.lower() in SUPPORTED_IMAGE_EXTS:
+                    paths.append(it)
+            return paths
+
+        def refresh_photos(items, current, old_paths):
+            paths = gallery_to_paths(items)
+            if paths == (old_paths or []):
+                return gr.update(), old_paths, current
+            value = current if current in paths else (paths[0] if paths else None)
+            idx = paths.index(value) if value else None
+            return gr.update(selected_index=idx), paths, value
+
+        def add_photos(files, items):
+            old = gallery_to_paths(items)
+            new = [f if isinstance(f, str) else getattr(f, 'name', None) for f in (files or [])]
+            return old + [p for p in new if p and p not in old]
+
+        def select_photo(evt: gr.SelectData, paths):
+            i = evt.index if isinstance(evt.index, int) else evt.index[0]
+            return paths[i] if paths and 0 <= i < len(paths) else gr.update()
+
+        def on_switch(new, prev, store, *vals):
+            n = len(param_comps)
+            params, results = list(vals[:n]), list(vals[n:])
+            store = dict(store or {})
+            keep = [gr.update()] * n
+            if not new:
+                return [store, None, gr.update(visible=False)] + keep + [gr.update()] * len(results)
+            if prev and prev != new:
+                store.setdefault(prev, {})['params'] = params
+            entry = store.get(new, {})
+            if entry.get('params') is not None:
+                restored = entry['params']
+                shown = entry.get('result') or empty_results
+                return [store, new, gr.update(visible=False)] + list(restored) + list(shown)
+            ask = prev is not None and prev != new
+            return [store, new, gr.update(visible=ask)] + keep + list(empty_results)
+
+        def snapshot(photo, store, *vals):
+            if not photo:
+                return store
+            n = len(param_comps)
+            store = dict(store or {})
+            entry = store.setdefault(photo, {})
+            entry['params'] = list(vals[:n])
+            entry['result'] = tuple(vals[n:])
+            return store
+
+        def download_all(store, lang):
+            def flat(v):
+                if not v:
+                    return []
+                return [x for x in ([v] if isinstance(v, str) else v) if isinstance(x, str) and not x.endswith('.zip')]
+            entries = [e['result'] for e in (store or {}).values() if e.get('result') and e['result'][2]]
+            files = []
+            for r in entries:
+                files += flat(r[2]) + flat(r[3])
+            files = [f for f in files if os.path.exists(f)]
+            if not files:
+                gr.Warning(t('download_all_empty', lang))
+                return None
+            out = os.path.join(tempfile.mkdtemp(prefix="liying_all_"), f"all_photos_{int(time.time())}.zip")
+            used = set()
+            with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    name, n = os.path.basename(f), 1
+                    while name in used:
+                        n += 1
+                        name = f"{n}_{os.path.basename(f)}"
+                    used.add(name)
+                    zf.write(f, arcname=name)
+            return out
+
+        download_all_btn.click(download_all, [photo_store, lang_dropdown], [download_all_file])
+
+        def pick_file(files, current, store):
+            paths = list(files or [])
+            target = [current] if current in paths else paths
+            result = (store or {}).get(current, {}).get('result') if current else None
+            return target, (result[-1] if result else None)
+
+        switch_args = dict(
+            fn=on_switch,
+            inputs=[current_photo, prev_photo, photo_store] + param_comps + result_comps,
+            outputs=[photo_store, prev_photo, switch_prompt] + param_comps + result_comps
+        )
+        add_photos_btn.upload(add_photos, [add_photos_btn, photo_gallery], [photo_gallery])
+        photo_gallery.change(
+            refresh_photos, [photo_gallery, current_photo, gallery_paths], [photo_gallery, gallery_paths, current_photo]
+        ).then(**switch_args)
+        photo_gallery.select(select_photo, [gallery_paths], [current_photo]).then(**switch_args)
+        use_prev_btn.click(lambda: gr.update(visible=False), None, [switch_prompt])
+        use_default_btn.click(lambda: [gr.update(visible=False)] + list(param_defaults), None, [switch_prompt] + param_comps)
+
+        bg_preview_evt.then(
+            snapshot, [current_photo, photo_store] + param_comps + result_comps, [photo_store]
+        )
+
         process_btn.click(
+            pick_file, [gallery_paths, current_photo, photo_store], [sel_files, sel_prev_dir]
+        ).then(
             process_and_display_wrapper,
-            inputs=[input_image, yolov8_path, yunet_path, rmbg_path, size_config, color_config,
+            inputs=[sel_files, yolov8_path, yunet_path, rmbg_path, size_config, color_config,
                     photo_type, photo_sheet_size, background_color, compress, change_background,
                     rotate, resize, sheet_rows, sheet_cols, layout_only, add_crop_lines,
                     target_size, size_range_min, size_range_max, use_csv_size, layout_position, photos_spacing,
-                    lang_dropdown, batch_temp_dir],
-            outputs=[output_image, corrected_output, download_final_file, download_corrected_file,
-                     batch_final_images, batch_corrected_images, batch_corrected_images_alpha, batch_processed_paths,
-                     batch_download_offset, batch_temp_dir]
+                    lang_dropdown, sel_prev_dir] + post_inputs,
+            outputs=result_comps
+        ).then(
+            snapshot, [current_photo, photo_store] + param_comps + result_comps, [photo_store]
         )
 
         def select_batch_result(evt: gr.SelectData, final_images, corrected_images, offset):
@@ -1220,11 +1474,11 @@ def create_demo(initial_language, deployment_mode):
             outputs=[output_image, corrected_output]
         )
 
-        def save_image_handler_wrapper(image, path, lang, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, is_corrected):
+        def save_image_handler_wrapper(image, path, lang, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, photo, is_corrected):
             return save_image_handler(
                 image, path, lang, photo_type, photo_sheet_size, background_color,
                 compress, use_csv_size, target_size, size_range_min, size_range_max,
-                is_corrected, is_download_mode=False
+                is_corrected, is_download_mode=False, photo=photo
             )
         
         final_save_fn = partial(save_image_handler_wrapper, is_corrected=False)
@@ -1232,13 +1486,13 @@ def create_demo(initial_language, deployment_mode):
 
         save_final_btn.click(
             final_save_fn,
-            inputs=[output_image, save_final_path, lang_dropdown, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max],
+            inputs=[output_image, save_final_path, lang_dropdown, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, current_photo],
             outputs=[notification]
         )
 
         save_corrected_btn.click(
             corrected_save_fn,
-            inputs=[corrected_output, save_corrected_path, lang_dropdown, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max],
+            inputs=[corrected_output, save_corrected_path, lang_dropdown, photo_type, photo_sheet_size, background_color, compress, use_csv_size, target_size, size_range_min, size_range_max, current_photo],
             outputs=[notification]
         )
     
@@ -1278,7 +1532,7 @@ def get_config_value(env_var_name, default_value, value_type=str, choices=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LiYing Photo Processing System")
-    parser.add_argument("--lang", type=str, choices=['en', 'zh'], default=get_config_value('lang', get_language(), str, ['en', 'zh']),
+    parser.add_argument("--lang", type=str, choices=['en', 'zh'], default=get_config_value('lang', 'zh', str, ['en', 'zh']),
                         help="Specify the language (en/zh)")
     parser.add_argument("--server_name", type=str, default=get_config_value('server_name', "127.0.0.1"), help="Specify the hostname or IP address the server should bind to (default: 127.0.0.1)")
     parser.add_argument("--server_port", type=int, default=get_config_value('server_port', 7860, int), help="Specify the port number the server should listen on (default: 7860)")
