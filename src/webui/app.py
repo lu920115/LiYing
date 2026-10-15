@@ -33,7 +33,7 @@ DEFAULT_YOLOV8_PATH = os.path.join(MODEL_DIR, 'yolov8n-pose.onnx')
 DEFAULT_YUNET_PATH = os.path.join(MODEL_DIR, 'face_detection_yunet_2023mar.onnx')
 LOCAL_MODEL_DIR = os.environ.get('LIYING_MODEL_DIR', '/Users/wenquanlu/31localmodel/liying')
 _BIREFNET = os.path.join(LOCAL_MODEL_DIR, 'BiRefNet-portrait-epoch_150.onnx')
-DEFAULT_RMBG_PATH = _BIREFNET if os.path.exists(_BIREFNET) else os.path.join(MODEL_DIR, 'RMBG-1.4-model.onnx')
+DEFAULT_RMBG_PATH = _BIREFNET if (os.path.exists(_BIREFNET) and not os.environ.get('LIYING_USE_RMBG')) else os.path.join(MODEL_DIR, 'RMBG-1.4-model.onnx')
 DEFAULT_SIZE_CONFIG = os.path.join(DATA_DIR, 'size_{}.csv')
 DEFAULT_COLOR_CONFIG = os.path.join(DATA_DIR, 'color_{}.csv')
 
